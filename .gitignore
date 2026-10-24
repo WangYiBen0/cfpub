@@ -1,0 +1,11 @@
+# The proxy route table when it falls back to living inside the repo
+cfpub/routes.json
+*.routes.json.tmp
+
+# Python bytecode from cfpub-proxy.py
+__pycache__/
+*.pyc
+
+# Scratch space for local testing
+.e2e/
+.run/
