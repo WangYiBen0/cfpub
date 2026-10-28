@@ -168,6 +168,9 @@ Every setting has a default; none are required.
 | `CFPUB_PROXY_PORT`                   | `8080`                         | Where the prefix-stripping proxy binds      |
 | `CFPUB_STATE`                        | `$XDG_STATE_HOME/cfpub/routes.json` | Proxy route table                      |
 | `CFPUB_RETRIES`                      | `4`                            | Attempts per API call on connection failure |
+| `CFPUB_MAX_BODY`                      | `64m`                          | Largest request body the proxy buffers |
+| `CFPUB_MAX_CONNECTIONS`               | `256`                          | Concurrent connections the proxy accepts |
+| `CFPUB_TLS_INSECURE`                  | off                            | Accept self-signed certs from `https://` targets |
 | `CFPUB_API_TOKEN`, `CFPUB_ACCOUNT_ID`, `CFPUB_ZONE_ID` | from `cert.pem` | Override the parsed credentials |
 
 The route table falls back to `/tmp` and then to `./cfpub/` if the state
@@ -179,16 +182,27 @@ and asks for `CFPUB_TUNNEL_ID`.
 ## Limits
 
 - **One machine per path segment.** Two machines need two `CFPUB_HOST_NAME`
-  values; they can share the zone and the apex record.
+  values; they can share the zone, the apex record *and* the tunnel. The
+  ingress rules are keyed by the pair `(hostname, path)`, so machines sharing a
+  tunnel never overwrite each other's `/<machine>/<service>` rules even when
+  they publish the same service name — one path rule per machine, all pointing
+  at port 8080. `ls` prints the hostname as its first column because, on a
+  shared tunnel, the path alone does not identify a rule.
 - **The proxy speaks HTTP/1.1 only.** It does not tunnel WebSocket upgrades —
   it strips `Upgrade`/`Connection`. Publish a WebSocket service over raw TCP
   instead, or put it behind a hostname of its own.
+- **Request bodies are buffered, responses are streamed.** A body larger than
+  `CFPUB_MAX_BODY` is refused with 413 rather than buffered, and one connection
+  per request keeps framing predictable — at the cost of keep-alive reuse.
+  `Transfer-Encoding: chunked` is rejected outright.
 - **Apps must be prefix-aware.** The proxy sets `X-Forwarded-Prefix` and strips
   the prefix before forwarding, but an app that emits absolute URLs in its HTML
   or redirects will need to be told about the prefix.
 - **The ingress `path` value is a regex**, and cfpub writes it unanchored, so
   `/x/sxyz-79/web` also matches the rule. The proxy then 404s it, since it only
-  strips an exact prefix — harmless, but not tight.
+  strips an exact prefix — harmless, but not tight. Because the path is a
+  regex, the machine segment is restricted to letters, digits and inner dashes;
+  a value like `.*` would otherwise match every machine's rules.
 - **`run` must stay running.** Publishing only writes edge configuration; with
   no connector up, the edge answers `530` or `websocket: bad handshake`.
 
@@ -204,6 +218,27 @@ try to log in. Before you do that:
 
 The tunnel token is an account-wide credential. cfpub keeps it in a `0600`
 temporary file for the connector's lifetime and never writes it anywhere else.
+The API token is never put on a command line either — it reaches `curl` through
+a config on a file descriptor, so it does not show up in `ps` or
+`/proc/<pid>/cmdline`. `token` warns when its output is not a terminal.
+
+The proxy treats everything it receives as hostile, since the tunnel is on the
+public internet and the listening port is on localhost:
+
+- dot segments (`..`, `%2e%2e`, `..;`) are refused, so a published prefix stays
+  a prefix rather than a suggestion to the origin;
+- `Transfer-Encoding` and conflicting `Content-Length` are refused, which closes
+  the request-smuggling path around path-based access rules;
+- `X-Forwarded-For`, `X-Forwarded-Prefix` and friends from the client are
+  dropped and re-derived, so they cannot be spoofed;
+- upstream failures return a fixed 502, so a target URL that embeds credentials
+  is not echoed to the client;
+- connections and body size are capped, and a stuck client is dropped after 30s.
+
+`routes.json` is written atomically with `mktemp` and is `0600`; the directory
+holding it must be owned by the invoking user, not a symlink, and not
+group/other-writable. A present-but-unparseable table is an error, not an
+invitation to start from scratch, because it holds every published route.
 
 ## Layout
 

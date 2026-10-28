@@ -27,11 +27,22 @@ is a script rather than a declarative module.
    without a rule yields a 404; a rule without a record is an invisible black
    hole that looks like nothing happened.
 3. **The ingress list must end with an unfiltered rule.** Cloudflare rejects it
-   otherwise (error 1056). Path rules go first, longest path first.
-4. **No secrets in the repo.** Credentials come from `~/.cloudflared/cert.pem`
-   at runtime; the tunnel token only ever lives in a `0600` temp file.
-5. **Comments explain *why*.** The code is short; the reasoning is the value.
-6. **`run`'s two halves stay independent.** `--connector` must not need
+   otherwise (error 1056). Order is: path rules (longest first), then
+   hostname-only tails for other subdomains, then the apex catch-all into the
+   proxy, then any legacy unfiltered rule the operator put there, then
+   `http_status:404`.
+4. **A rule is identified by `(hostname, path)`, never by `path` alone.** One
+   tunnel can serve several machines, and every machine publishes the same
+   shape of path (`/<machine>/<service>`). Select, dedupe and delete on the
+   pair, or `pub`/`rm` on one machine will silently drop or duplicate another
+   machine's rules. This is why `rewrite_ingress` keeps foreign rules verbatim
+   and `ls` prints a hostname column.
+5. **No secrets in the repo, and none on a command line.** Credentials come
+   from `~/.cloudflared/cert.pem` at runtime; the tunnel token only ever lives in
+   a `0600` temp file, and the API token reaches `curl` through `-K` on a file
+   descriptor because `/proc/<pid>/cmdline` is world-readable.
+6. **Comments explain *why*.** The code is short; the reasoning is the value.
+7. **`run`'s two halves stay independent.** `--connector` must not need
    `python3`, a route table, or anything HTTP; `--proxy` must not need
    credentials or `cloudflared`. `main` therefore loads credentials *after*
    parsing the selectors, and only when the connector is actually starting.
@@ -101,7 +112,11 @@ These all cost real debugging time. Do not reintroduce them.
   like `def f: ...; [ ... ] as $x | (... | unique_by(.path))` fails with
   "Cannot index array with string", because the filter receives the *array*, not
   its elements. Bind each stage to its own `$var` first. This is why
-  `rewrite_ingress` has separate `$paths` / `$joined` / `$uniq` / `$sorted`.
+  `rewrite_ingress` has separate `$kept` / `$paths` / `$sorted`.
+- **Sorting ingress rules by path length alone is unstable.** `sort_by(-(.path |
+  length))` leaves ties in arbitrary order, and a path-only rule for the same
+  prefix would then shadow the hostname-scoped one. That is why the sort key is
+  `[-(.path | length), (has("hostname") | not), (.hostname // "")]`.
 - **`pkill -f <anything>` kills the calling shell when the pattern appears in
   its own command line.** Bites with `cfpub-proxy.py` *and* with
   `cloudflared tunnel`. Use `pkill -x cloudflared` (process name only) or kill
@@ -114,6 +129,25 @@ These all cost real debugging time. Do not reintroduce them.
   keeping the assignment first removes the ordering question entirely.
 - **`pub ssh 22` publishes HTTP**, not SSH. A bare port always means HTTP by
   design; SSH needs the explicit `ssh://localhost:22`.
+- **The proxy must not pass framing through.** It used to read only
+  `Content-Length` and ignore `Transfer-Encoding`, so a chunked request left its
+  payload on the socket, and the HTTP server parsed that payload as *the next
+  request* — which the proxy then routed to whichever prefix it named. One edge
+  request to a public path could reach a protected path's origin, straight past
+  path-scoped Access rules. Refuse `Transfer-Encoding` and conflicting
+  `Content-Length`, and never reuse the connection.
+- **A path is not a sandbox if `..` reaches the origin.** `/prefix/../admin` is
+  normalised by nginx `alias`, SPA fallbacks and `SimpleHTTPRequestHandler`, so
+  the origin serves a directory the operator never published. Reject dot
+  segments before selecting a route.
+- **`mkdir -p` is not a writability probe.** It succeeds on any existing
+  directory, so an unwritable state dir was selected and `pub` failed only after
+  DNS and ingress were committed. Probe by writing, and check the directory is
+  owned by this user and not group/other-writable — whoever owns it can rewrite
+  the route table into an SSRF.
+- **`jq ... > "$STATE.tmp"` follows symlinks.** A predictable temp name in a
+  shared directory lets another user point it at a file of their choosing and
+  have `pub` overwrite it. Use `mktemp` in the same directory, then rename.
 
 ## Style
 
